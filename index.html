@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bateria — Presenças & Ritmistas (com Backend)</title>
+  <meta name="theme-color" content="#000000">
+  <link rel="manifest" href="manifest.webmanifest">
+  <script>
+    // Registra o Service Worker (PWA) — opcional
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js').catch(console.error);
+      });
+    }
+  </script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- Firebase compat CDN (mais simples para HTML puro) -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+
+  <style>html,body{height:100%}</style>
+</head>
+<body class="min-h-screen bg-gray-100">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useEffect, useMemo, useState } = React;
+
+    // ====== CONFIGURE AQUI seu Firebase ======
+    const firebaseConfig = {
+      apiKey: "SUA_API_KEY",
+      authDomain: "SEU_PROJETO.firebaseapp.com",
+      projectId: "SEU_PROJETO",
+      storageBucket: "SEU_PROJETO.appspot.com",
+      messagingSenderId: "000000000000",
+      appId: "1:000000000000:web:xxxxxxxxxxxxxxxxxxxxxx"
+    };
+    // =========================================
+
+    // Inicializa Firebase
+    const app = firebase.initializeApp(firebaseConfig);
+    const auth = firebase.auth();
+    const db = firebase.firestore();
+
+    // Use um "espaço" (tenant) para separar dados por grupo. Todos vendo o mesmo SPACE_ID
+    // compartilham as mesmas coleções (multiusuário em tempo real).
+    const DEFAULT_SPACE_ID = "bateria-default";
+
+    // Utils -------------------------------------------------
+    const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Math.random().toString(36).slice(2) + Date.now().toString(36));
+    const todayISO = () => new Date().toISOString().slice(0,10);
+    const fmtDateBR = (iso) => iso && iso.length===10 ? iso.split('-').reverse().join('/') : (iso ? new Date(iso).toLocaleDateString('pt-BR') : '');
+    const csvEscape = (v) => { if(v==null) return ''; const s=String(v).replaceAll('"','""'); return /[",\\n]/.test(s) ? '"'+s+'"' : s; };
+    const downloadBlob = (filename, text, type='text/plain;charset=utf-8') => { const blob=new Blob([text],{type}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); };
+
+    // ===== Backend Store (Firestore) =====
+    const useStore = (spaceId) => {
+      const [ritmistas, setRitmistas] = useState([]);
+      const [ensaios, setEnsaios] = useState([]);
+      const [presencas, setPresencas] = useState([]);
+      const [loading, setLoading] = useState(true);
+
+      useEffect(() => {
+        setLoading(true);
+        const unsubR = db.collection('ritmistas').where('spaceId','==',spaceId).onSnapshot(ss=>{
+          setRitmistas(ss.docs.map(d => ({ id: d.id, ...d.data() })));
+        });
+        const unsubE = db.collection('ensaios').where('spaceId','==',spaceId).onSnapshot(ss=>{
+          setEnsaios(ss.docs.map(d => ({ id: d.id, ...d.data() })));
+        });
+        const unsubP = db.collection('presencas').where('spaceId','==',spaceId).onSnapshot(ss=>{
+          setPresencas(ss.docs.map(d => ({ id: d.id, ...d.data() })));
+        });
+        const timer = setTimeout(()=>setLoading(false), 500);
+        return () => { unsubR(); unsubE(); unsubP(); clearTimeout(timer); };
+      }, [spaceId]);
+
+      // Ritmistas
+      const addR = async (r) => {
+        const now = new Date().toISOString();
+        await db.collection('ritmistas').add({ ...r, spaceId, createdAt: now, updatedAt: now });
+      };
+      const updR = async (id, patch) => {
+        const now = new Date().toISOString();
+        await db.collection('ritmistas').doc(id).update({ ...patch, updatedAt: now });
+      };
+      const delR = async (id) => {
+        // Apaga também presenças vinculadas
+        const batch = db.batch();
+        const pres = await db.collection('presencas').where('spaceId','==',spaceId).where('ritmistaId','==',id).get();
+        pres.forEach(doc => batch.delete(doc.ref));
+        batch.delete(db.collection('ritmistas').doc(id));
+        await batch.commit();
+      };
+
+      // Ensaios
+      const addE = async (e) => {
+        const now = new Date().toISOString();
+        await db.collection('ensaios').add({ ...e, spaceId, createdAt: now, updatedAt: now });
+      };
+      const updE = async (id, patch) => {
+        const now = new Date().toISOString();
+        await db.collection('ensaios').doc(id).update({ ...patch, updatedAt: now });
+      };
+      const delE = async (id) => {
+        // Apaga presenças vinculadas
+        const batch = db.batch();
+        const pres = await db.collection('presencas').where('spaceId','==',spaceId).where('ensaioId','==',id).get();
+        pres.forEach(doc => batch.delete(doc.ref));
+        batch.delete(db.collection('ensaios').doc(id));
+        await batch.commit();
+      };
+
+      // Presenças (bulk upsert pro ensaio)
+      const bulkUpsert = async (ensaioId, rows) => {
+        const now = new Date().toISOString();
+        const presRef = db.collection('presencas');
+        const existing = await presRef.where('spaceId','==',spaceId).where('ensaioId','==',ensaioId).get();
+        const mapByR = new Map(existing.docs.map(d => [d.data().ritmistaId, {id:d.id, ...d.data()}]));
+        const batch = db.batch();
+        rows.forEach(row => {
+          const prev = mapByR.get(row.ritmistaId);
+          if (prev) {
+            batch.update(presRef.doc(prev.id), { status: row.status, observacoes: row.observacoes || '', updatedAt: now });
+          } else {
+            const newRef = presRef.doc();
+            batch.set(newRef, { id: newRef.id, spaceId, ensaioId, ritmistaId: row.ritmistaId, status: row.status, observacoes: row.observacoes || '', createdAt: now, updatedAt: now });
+          }
+        });
+        await batch.commit();
+      };
+
+      // Limpar tudo do espaço
+      const clearAll = async () => {
+        const batch = db.batch();
+        for (const col of ['ritmistas','ensaios','presencas']) {
+          const snap = await db.collection(col).where('spaceId','==',spaceId).get();
+          snap.forEach(doc => batch.delete(doc.ref));
+        }
+        await batch.commit();
+      };
+
+      return { store:{ ritmistas, ensaios, presencas }, addR, updR, delR, addE, updE, delE, bulkUpsert, clearAll, loading };
+    };
+
+    // UI atoms ----------------------------------------------
+    const Badge = ({children,className=''}) => <span className={'inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-gray-100 '+className}>{children}</span>;
+    const Button = ({children,onClick,type='button',variant='primary',className='',disabled}) => {
+      const base='rounded-2xl px-3 py-2 text-sm font-medium shadow-sm transition disabled:opacity-50';
+      const styles={ primary:'bg-black text-white hover:bg-gray-800', ghost:'bg-transparent border border-gray-300 hover:bg-gray-50', danger:'bg-red-600 text-white hover:bg-red-500' };
+      return <button type={type} onClick={onClick} disabled={disabled} className={\`\${base} \${styles[variant]} \${className}\`}>{children}</button>;
+    };
+    const Input = ({label,...props}) => <label className="block"><span className="text-sm text-gray-700">{label}</span><input {...props} className="mt-1 w-full rounded-xl border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-black"/></label>;
+    const Textarea = ({label,...props}) => <label className="block"><span className="text-sm text-gray-700">{label}</span><textarea {...props} className="mt-1 w-full rounded-xl border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-black"/></label>;
+    const Card = ({title,actions,children}) => (
+      <div className="rounded-2xl border bg-white p-4 shadow-sm">
+        <div className="mb-3 flex items-center justify-between">
+          <h3 className="text-lg font-semibold">{title}</h3>
+          <div className="flex gap-2">{actions}</div>
+        </div>
+        <div>{children}</div>
+      </div>
+    );
+
+    // --------------- Ritmistas ------------------------------
+    function RitmistasPage({storeHook, goToRitmista}){
+      const {store,addR,updR,delR} = storeHook;
+      const [q,setQ]=useState('');
+      const [f,setF]=useState({camiseta:'',calca:'',sapato:''});
+      const [form,setForm]=useState({nome:'',apelido:'',telefone:'',camiseta:'',calca:'',sapato:''});
+      const [editId,setEditId]=useState(null);
+      const filtered = useMemo(()=>{const s=q.trim().toLowerCase(); return store.ritmistas.filter(r=>{ const okQ=!s||r.nome.toLowerCase().includes(s)||(r.apelido||'').toLowerCase().includes(s); const ok1=!f.camiseta||(r.camiseta||'')===f.camiseta; const ok2=!f.calca||(r.calca||'')===f.calca; const ok3=!f.sapato||(r.sapato||'')===f.sapato; return okQ&&ok1&&ok2&&ok3;});},[store.ritmistas,q,f]);
+      const reset=()=>{setForm({nome:'',apelido:'',telefone:'',camiseta:'',calca:'',sapato:''}); setEditId(null);};
+      const submit=async (e)=>{e.preventDefault(); if(!form.nome.trim()){alert('Nome é obrigatório');return;} if(editId){await updR(editId,{...form});} else {await addR(form);} reset();};
+      const startEdit=(r)=>{setEditId(r.id); setForm({nome:r.nome,apelido:r.apelido||'',telefone:r.telefone||'',camiseta:r.camiseta||'',calca:r.calca||'',sapato:r.sapato||''});};
+      const exportCSV=()=>{const header=['id','nome','apelido','telefone','camiseta','calca','sapato','createdAt','updatedAt']; const rows=store.ritmistas.map(r=>[r.id,r.nome,r.apelido||'',r.telefone||'',r.camiseta||'',r.calca||'',r.sapato||'',r.createdAt,r.updatedAt].map(csvEscape).join(',')); downloadBlob('ritmistas.csv',[header.join(','),...rows].join('\\n'),'text/csv;charset=utf-8');};
+      return (<div className="space-y-4">
+        <Card title="Ritmistas" actions={<Button variant="ghost" onClick={exportCSV}>Exportar CSV</Button>}>
+          <div className="mb-3 grid grid-cols-1 gap-3 md:grid-cols-5">
+            <Input label="Buscar por nome/apelido" value={q} onChange={e=>setQ(e.target.value)} placeholder="Ex.: João ou Pandeiro"/>
+            <Input label="Filtro Camiseta" value={f.camiseta} onChange={e=>setF(v=>({...v,camiseta:e.target.value}))} placeholder="P/M/G/GG"/>
+            <Input label="Filtro Calça" value={f.calca} onChange={e=>setF(v=>({...v,calca:e.target.value}))} placeholder="38/40/42"/>
+            <Input label="Filtro Sapato" value={f.sapato} onChange={e=>setF(v=>({...v,sapato:e.target.value}))} placeholder="39/40/41"/>
+            <div className="flex items-end"><Button variant="ghost" onClick={()=>{setQ('');setF({camiseta:'',calca:'',sapato:''});}}>Limpar filtros</Button></div>
+          </div>
+          <Table columns={[
+            {header:'Nome', cell:(r)=><div className="font-medium">{r.nome} {r.apelido && <Badge className="ml-2">{r.apelido}</Badge>}</div>},
+            {header:'Telefone', cell:(r)=><span>{r.telefone||'-'}</span>},
+            {header:'Camiseta', cell:(r)=>r.camiseta||'-'},
+            {header:'Calça', cell:(r)=>r.calca||'-'},
+            {header:'Sapato', cell:(r)=>r.sapato||'-'},
+            {header:'Ações', cell:(r)=>(<div className="flex gap-2"><Button variant="ghost" onClick={()=>goToRitmista(r.id)}>Ver perfil</Button><Button variant="ghost" onClick={()=>startEdit(r)}>Editar</Button><Button variant="danger" onClick={()=>{ if(confirm('Excluir ritmista e presenças vinculadas?')) delR(r.id);}}>Excluir</Button></div>)},
+          ]} data={filtered}/>
+        </Card>
+        <Card title={editId?'Editar Ritmista':'Novo Ritmista'} actions={editId && <Button variant="ghost" onClick={reset}>Cancelar edição</Button>}>
+          <form onSubmit={submit} className="grid grid-cols-1 gap-3 md:grid-cols-3">
+            <Input label="Nome *" value={form.nome} onChange={e=>setForm(v=>({...v,nome:e.target.value}))}/>
+            <Input label="Apelido" value={form.apelido} onChange={e=>setForm(v=>({...v,apelido:e.target.value}))}/>
+            <Input label="Telefone" value={form.telefone} onChange={e=>setForm(v=>({...v,telefone:e.target.value}))} placeholder="(11) 90000-0000"/>
+            <Input label="Camiseta" value={form.camiseta} onChange={e=>setForm(v=>({...v,camiseta:e.target.value}))} placeholder="P/M/G/GG"/>
+            <Input label="Calça" value={form.calca} onChange={e=>setForm(v=>({...v,calca:e.target.value}))} placeholder="38/40/42"/>
+            <Input label="Sapato" value={form.sapato} onChange={e=>setForm(v=>({...v,sapato:e.target.value}))} placeholder="39/40/41"/>
+            <div className="col-span-full"><Button type="submit">{editId?'Salvar alterações':'Adicionar ritmista'}</Button></div>
+          </form>
+        </Card>
+      </div>);
+    }
+
+    function RitmistaDetail({storeHook, rid, goBack}){
+      const {store, updR} = storeHook;
+      const r = store.ritmistas.find(x=>x.id===rid);
+      if(!r) return <Card title="Ritmista não encontrado" actions={<Button variant="ghost" onClick={goBack}>Voltar</Button>}></Card>;
+      const participacoes = store.presencas.filter(p=>p.ritmistaId===rid);
+      const byEnsaio = participacoes.map(p=> ({ p, ensaio: store.ensaios.find(e=>e.id===p.ensaioId) })).filter(x=>!!x.ensaio).sort((a,b)=> a.ensaio.data.localeCompare(b.ensaio.data));
+      const cont = participacoes.reduce((acc,p)=>{acc[p.status]=(acc[p.status]||0)+1; return acc;}, {PRESENTE:0,AUSENTE:0,JUSTIFICADA:0});
+      return (
+        <div className="space-y-4">
+          <Card title={\`Perfil do Ritmista — \${r.nome}\${r.apelido?\` (\${r.apelido})\`:''}\`} actions={<Button variant="ghost" onClick={goBack}>Voltar</Button>}>
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+              <Input label="Nome" value={r.nome} onChange={(e)=>updR(r.id,{nome:e.target.value})}/>
+              <Input label="Apelido" value={r.apelido||''} onChange={(e)=>updR(r.id,{apelido:e.target.value})}/>
+              <Input label="Telefone" value={r.telefone||''} onChange={(e)=>updR(r.id,{telefone:e.target.value})}/>
+              <Input label="Camiseta" value={r.camiseta||''} onChange={(e)=>updR(r.id,{camiseta:e.target.value})}/>
+              <Input label="Calça" value={r.calca||''} onChange={(e)=>updR(r.id,{calca:e.target.value})}/>
+              <Input label="Sapato" value={r.sapato||''} onChange={(e)=>updR(r.id,{sapato:e.target.value})}/>
+            </div>
+          </Card>
+
+          <Card title="Relatório simples">
+            <div className="grid grid-cols-3 gap-3 text-center">
+              <div className="rounded-xl border p-3"><div className="text-xs text-gray-500">Presentes</div><div className="text-2xl font-bold">{cont.PRESENTE||0}</div></div>
+              <div className="rounded-xl border p-3"><div className="text-xs text-gray-500">Ausentes</div><div className="text-2xl font-bold">{cont.AUSENTE||0}</div></div>
+              <div className="rounded-xl border p-3"><div className="text-xs text-gray-500">Justificadas</div><div className="text-2xl font-bold">{cont.JUSTIFICADA||0}</div></div>
+            </div>
+          </Card>
+
+          <Card title="Ensaios que participou">
+            <Table columns={[
+              {header:'Data', cell:(x)=> fmtDateBR(x.ensaio.data)},
+              {header:'Status', cell:(x)=> x.p.status},
+              {header:'Obs.', cell:(x)=> x.p.observacoes || '-'},
+            ]} data={byEnsaio.map(x=>({...x, id:x.p.id}))} />
+          </Card>
+        </div>
+      );
+    }
+
+    // --------------- Ensaios --------------------------------
+    function PlanilhaPresenca({ensaioId,storeHook}){
+      const {store,bulkUpsert} = storeHook;
+      const ensaio = store.ensaios.find(e=>e.id===ensaioId);
+      const [rows,setRows] = useState(()=> store.ritmistas.map(r=>{ const p=store.presencas.find(x=>x.ensaioId===ensaioId&&x.ritmistaId===r.id); return {ritmistaId:r.id,status:p?.status||'',observacoes:p?.observacoes||''}; }));
+      useEffect(()=>{ setRows(store.ritmistas.map(r=>{ const p=store.presencas.find(x=>x.ensaioId===ensaioId&&x.ritmistaId===r.id); return {ritmistaId:r.id,status:p?.status||'',observacoes:p?.observacoes||''}; })); },[store.ritmistas,store.presencas,ensaioId]);
+      const setAll=(st)=> setRows(rs=>rs.map(r=>({...r,status:st})));
+      const salvar=async()=>{ await bulkUpsert(ensaioId,rows); alert('Presenças salvas!'); };
+      return (<Card title={\`Planilha de Presenças — \${fmtDateBR(ensaio?.data||'')}\`} actions={<><Button variant="ghost" onClick={()=>setAll('PRESENTE')}>Marcar todos como Presente</Button><Button variant="ghost" onClick={()=>setAll('')}>Limpar marcações</Button><Button onClick={salvar}>Salvar em lote</Button></> }>
+        <div className="overflow-auto rounded-xl border"><table className="min-w-full text-sm"><thead className="bg-gray-50"><tr><th className="px-3 py-2 text-left">Ritmista</th><th className="px-3 py-2 text-left">Telefone</th><th className="px-3 py-2 text-left">Status</th><th className="px-3 py-2 text-left">Observações</th></tr></thead>
+        <tbody className="divide-y">{store.ritmistas.map((r,i)=>(<tr key={r.id} className="odd:bg-white even:bg-gray-50"><td className="px-3 py-2"><span className="font-medium">{r.nome}</span> {r.apelido && <Badge className="ml-2">{r.apelido}</Badge>}</td><td className="px-3 py-2">{r.telefone||'-'}</td><td className="px-3 py-2"><select className="rounded-lg border border-gray-300 px-2 py-1" value={rows[i]?.status||''} onChange={e=>setRows(rs=>{const nx=rs.slice(); nx[i]={...nx[i],status:e.target.value}; return nx;})}><option value="">—</option><option value="PRESENTE">Presente</option><option value="AUSENTE">Ausente</option><option value="JUSTIFICADA">Justificada</option></select></td><td className="px-3 py-2"><input className="w-full rounded-lg border border-gray-300 px-2 py-1" value={rows[i]?.observacoes||''} onChange={e=>setRows(rs=>{const nx=rs.slice(); nx[i]={...nx[i],observacoes:e.target.value}; return nx;})} placeholder="Opcional"/></td></tr>))}</tbody></table></div>
+      </Card>);
+    }
+
+    function EnsaiosPage({storeHook, openDetail}){
+      const {store,addE,updE,delE} = storeHook;
+      const [form,setForm]=useState({data:todayISO(),observacoes:''});
+      const [editId,setEditId]=useState(null);
+      const sorted = useMemo(()=>[...store.ensaios].sort((a,b)=> (a.data<b.data?1:-1)),[store.ensaios]);
+
+      const submit=async (e)=>{ e.preventDefault(); if(!form.data){alert('Data é obrigatória'); return;} if(editId){ await updE(editId,{...form}); } else { await addE({data:form.data,observacoes:form.observacoes}); } setForm({data:todayISO(),observacoes:''}); setEditId(null); };
+      const startEdit=(x)=>{ setEditId(x.id); setForm({data:x.data,observacoes:x.observacoes||''}); };
+
+      return (<div className="space-y-4">
+        <Card title="Ensaios">
+          <Table columns={[
+            {header:'Data', cell:(e)=><div className="font-medium">{fmtDateBR(e.data)}</div>},
+            {header:'Observações', cell:(e)=> e.observacoes||'-'},
+            {header:'Ações', cell:(e)=>(<div className="flex gap-2"><Button onClick={()=>openDetail(e.id)}>Abrir</Button><Button variant="ghost" onClick={()=>startEdit(e)}>Editar</Button><Button variant="danger" onClick={()=>{ if(confirm('Excluir ensaio e presenças vinculadas?')) delE(e.id);}}>Excluir</Button></div>)}
+          ]} data={sorted}/>
+        </Card>
+        <Card title={editId?'Editar Ensaio':'Novo Ensaio'} actions={editId && <Button variant="ghost" onClick={()=>{ setEditId(null); setForm({data:todayISO(),observacoes:''});}}>Cancelar edição</Button>}>
+          <form onSubmit={submit} className="grid grid-cols-1 gap-3 md:grid-cols-3">
+            <Input label="Data *" type="date" value={form.data} onChange={e=>setForm(v=>({...v,data:e.target.value}))}/>
+            <Input label="Observações" value={form.observacoes} onChange={e=>setForm(v=>({...v,observacoes:e.target.value}))}/>
+            <div className="flex items-end gap-2"><Button type="submit">{editId?'Salvar alterações':'Adicionar ensaio'}</Button></div>
+          </form>
+        </Card>
+      </div>);
+    }
+
+    function EnsaioDetail({storeHook, ensaioId, goBack, goToRitmista}){
+      const {store} = storeHook;
+      const e = store.ensaios.find(x=>x.id===ensaioId);
+      if(!e) return <Card title="Ensaio não encontrado" actions={<Button variant="ghost" onClick={goBack}>Voltar</Button>}></Card>;
+      const linhas = store.ritmistas.map(r=>{
+        const p = store.presencas.find(x=>x.ensaioId===e.id && x.ritmistaId===r.id);
+        return { id:r.id, ritmista:r, status:p?.status||'-', observacoes:p?.observacoes||'' };
+      });
+      return (
+        <div className="space-y-4">
+          <Card title={\`Ensaio — \${fmtDateBR(e.data)}\`} actions={<Button variant="ghost" onClick={goBack}>Voltar</Button>}>
+            <div className="mb-3 text-sm text-gray-600">{e.observacoes || 'Sem observações'}</div>
+            <Table columns={[
+              {header:'Ritmista', cell:(x)=>(<button className="underline" onClick={()=>goToRitmista(x.ritmista.id)}>{x.ritmista.nome}{x.ritmista.apelido?\` (\${x.ritmista.apelido})\`:''}</button>)},
+              {header:'Telefone', cell:(x)=> x.ritmista.telefone || '-'},
+              {header:'Status', cell:(x)=> x.status},
+              {header:'Obs.', cell:(x)=> x.observacoes || '-'},
+            ]} data={linhas} />
+          </Card>
+
+          <Card title="Editar presenças deste ensaio">
+            <PlanilhaPresenca ensaioId={e.id} storeHook={storeHook} />
+          </Card>
+        </div>
+      );
+    }
+
+    // --------------- Relatórios / Backup --------------------
+    function RelatoriosPage({storeHook}){
+      const {store} = storeHook;
+      const [start,setStart]=useState('');
+      const [end,setEnd]=useState('');
+      const ensaiosPeriodo = useMemo(()=> store.ensaios.filter(e=> (!start||e.data>=start)&&(!end||e.data<=end)),[store.ensaios,start,end]);
+      const calc = useMemo(()=>{ const ids=new Set(ensaiosPeriodo.map(e=>e.id)); const total=ensaiosPeriodo.length; const byR=store.ritmistas.map(r=>{ const pres=store.presencas.filter(p=>p.ritmistaId===r.id && ids.has(p.ensaioId)); const c={PRESENTE:0,AUSENTE:0,JUSTIFICADA:0}; pres.forEach(p=>{ if(p.status in c) c[p.status]++; }); const pct= total? Math.round((c.PRESENTE/total)*100):0; return {r,totalEnsaios:total,...c,pct}; }); return {total,byR}; },[store.ritmistas,store.presencas,ensaiosPeriodo]);
+      const exportCSV=()=>{ const header=['ritmistaId','nome','apelido','totalEnsaios','presentes','ausentes','justificadas','pctPresenca(%)','periodoInicio','periodoFim']; const rows=calc.byR.map(x=>[x.r.id,x.r.nome,x.r.apelido||'',x.totalEnsaios,x.PRESENTE,x.AUSENTE,x.JUSTIFICADA,x.pct,start||'',end||''].map(csvEscape).join(',')); downloadBlob('relatorio-assiduidade.csv',[header.join(','),...rows].join('\\n'),'text/csv;charset=utf-8'); };
+      return (<div className="space-y-4">
+        <Card title="Relatório de Assiduidade" actions={<Button variant="ghost" onClick={exportCSV}>Exportar CSV</Button>}>
+          <div className="mb-3 grid grid-cols-1 gap-3 md:grid-cols-4">
+            <Input label="Início" type="date" value={start} onChange={e=>setStart(e.target.value)}/>
+            <Input label="Fim" type="date" value={end} onChange={e=>setEnd(e.target.value)}/>
+            <div className="flex items-end text-sm text-gray-600">Total de ensaios no período: <span className="ml-1 font-semibold">{calc.total}</span></div>
+          </div>
+          <Table columns={[
+            {header:'Ritmista', cell:(x)=><div className="font-medium">{x.r.nome} {x.r.apelido && <Badge className="ml-2">{x.r.apelido}</Badge>}</div>},
+            {header:'Presentes', cell:(x)=>x.PRESENTE},
+            {header:'Ausentes', cell:(x)=>x.AUSENTE},
+            {header:'Justificadas', cell:(x)=>x.JUSTIFICADA},
+            {header:'% Presença', cell:(x)=><div className="font-semibold">{x.pct}%</div>},
+          ]} data={calc.byR}/>
+        </Card>
+      </div>);
+    }
+
+    function BackupRestore({storeHook}){
+      const {clearAll} = storeHook;
+      return (<Card title="Admin">
+        <div className="flex flex-wrap items-center gap-3">
+          <Button variant="danger" onClick={()=>{ if(confirm('Zerar todos os dados deste espaço?')) clearAll();}}>Zerar tudo</Button>
+          <div className="text-xs text-gray-500">⚠️ Isto apaga ritmistas, ensaios e presenças do espaço atual.</div>
+        </div>
+      </Card>);
+    }
+
+    // --------------- Dashboard ------------------------------
+    function Dashboard({storeHook, goToEnsaio}){
+      const {store}=storeHook;
+      const proximos = useMemo(()=>[...store.ensaios].sort((a,b)=> a.data.localeCompare(b.data)).slice(0,5),[store.ensaios]);
+      const ranking = useMemo(()=>{ const total=store.ensaios.length||1; return store.ritmistas.map(r=>{ const pres=store.presencas.filter(p=>p.ritmistaId===r.id && p.status==='PRESENTE').length; const pct=Math.round((pres/total)*100); return {r,pct}; }).sort((a,b)=>b.pct-a.pct).slice(0,5); },[store]);
+      return (<div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <Card title="Próximos Ensaios"><ul className="space-y-2">{proximos.length===0 && <li className="text-sm text-gray-500">Sem ensaios cadastrados.</li>}{proximos.map(e=>(<li key={e.id} className="flex items-center justify-between rounded-xl border p-3"><div><div className="font-semibold">{fmtDateBR(e.data)}</div><div className="text-sm text-gray-600">{e.observacoes||'—'}</div></div><Button variant="ghost" onClick={()=>goToEnsaio(e.id)}>Abrir</Button></li>))}</ul></Card>
+        <Card title="Top 5 Assiduidade"><ul className="space-y-2">{ranking.length===0 && <li className="text-sm text-gray-500">Sem dados suficientes.</li>}{ranking.map((x,i)=>(<li key={x.r.id} className="flex items-center justify-between rounded-xl border p-3"><div className="flex items-center gap-3"><div className="flex h-7 w-7 items-center justify-center rounded-full border bg-gray-50 font-semibold">{i+1}</div><div className="font-semibold">{x.r.nome}{x.r.apelido?\` (\${x.r.apelido})\`:''}</div></div><div className="font-semibold">{x.pct}%</div></li>))}</ul></Card>
+      </div>);
+    }
+
+    // --------------- Auth UI -------------------------------
+    function AuthBar({user, onLogout}){
+      return (
+        <div className="flex items-center gap-3">
+          <div className="text-sm text-gray-700">Olá, <span className="font-semibold">{user.displayName || user.email}</span></div>
+          <Button variant="ghost" onClick={onLogout}>Sair</Button>
+        </div>
+      );
+    }
+    function SignInView(){
+      const signIn = async () => {
+        const provider = new firebase.auth.GoogleAuthProvider();
+        await auth.signInWithPopup(provider);
+      };
+      return (
+        <div className="flex min-h-[50vh] items-center justify-center">
+          <div className="rounded-2xl border bg-white p-6 text-center shadow-sm">
+            <div className="mb-2 text-xl font-semibold">Bateria — Presenças & Ritmistas</div>
+            <div className="mb-4 text-sm text-gray-600">Entre para colaborar em tempo real</div>
+            <Button onClick={signIn}>Entrar com Google</Button>
+          </div>
+        </div>
+      );
+    }
+
+    // --------------- App / Router ---------------------------
+    function App(){
+      const [user, setUser] = useState(null);
+      const [spaceId, setSpaceId] = useState(DEFAULT_SPACE_ID);
+      const storeHook = useStore(spaceId);
+      const [view,setView] = useState({name:'dashboard'});
+
+      useEffect(()=>{
+        const unsub = auth.onAuthStateChanged(u => setUser(u));
+        return () => unsub();
+      }, []);
+
+      const navBtn = (id,label) => (
+        <button onClick={()=>setView({name:id})} className={\`rounded-2xl px-3 py-2 text-sm font-medium \${view.name===id ? 'bg-black text-white':'hover:bg-gray-100'}\`}>{label}</button>
+      );
+
+      if(!user) return <SignInView />;
+
+      const logout = () => auth.signOut();
+
+      return (
+        <div className="min-h-screen">
+          <header className="sticky top-0 z-20 border-b bg-white/80 backdrop-blur">
+            <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
+              <div className="flex items-center gap-3">
+                <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-black text-white">B</div>
+                <h1 className="text-lg font-semibold">Bateria — Presenças & Ritmistas</h1>
+                <div className="ml-3 hidden items-center gap-2 md:flex">
+                  <span className="text-xs text-gray-600">Espaço:</span>
+                  <input className="w-44 rounded-xl border px-2 py-1 text-sm" value={spaceId} onChange={e=>setSpaceId(e.target.value)} title="Mude o espaço para separar grupos"/>
+                </div>
+              </div>
+              <nav className="flex items-center gap-2">
+                {navBtn('dashboard','Dashboard')}
+                {navBtn('ritmistas','Ritmistas')}
+                {navBtn('ensaios','Ensaios')}
+                {navBtn('relatorios','Relatórios')}
+                {navBtn('backup','Admin')}
+                <div className="ml-2"><AuthBar user={user} onLogout={logout} /></div>
+              </nav>
+            </div>
+          </header>
+
+          <main className="mx-auto max-w-6xl space-y-4 px-4 py-6">
+            {storeHook.loading && <div className="text-sm text-gray-500">Carregando dados...</div>}
+            {view.name==='dashboard' && <Dashboard storeHook={storeHook} goToEnsaio={(id)=>setView({name:'ensaioDetail', id})} />}
+            {view.name==='ritmistas' && <RitmistasPage storeHook={storeHook} goToRitmista={(id)=>setView({name:'ritmistaDetail', id})} />}
+            {view.name==='ritmistaDetail' && <RitmistaDetail storeHook={storeHook} rid={view.id} goBack={()=>setView({name:'ritmistas'})} />}
+            {view.name==='ensaios' && <EnsaiosPage storeHook={storeHook} openDetail={(id)=>setView({name:'ensaioDetail', id})} />}
+            {view.name==='ensaioDetail' && <EnsaioDetail storeHook={storeHook} ensaioId={view.id} goBack={()=>setView({name:'ensaios'})} goToRitmista={(id)=>setView({name:'ritmistaDetail', id})} />}
+            {view.name==='relatorios' && <RelatoriosPage storeHook={storeHook} />}
+            {view.name==='backup' && <BackupRestore storeHook={storeHook} />}
+            <footer className="pt-4 text-center text-xs text-gray-500">Dados salvos no Firestore (tempo real). Para separar grupos, altere o campo <span className="font-mono">spaceId</span> no topo.</footer>
+          </main>
+        </div>
+      );
+    }
+
+    // Tabela genérica ---------------------------------------
+    const Table = ({columns,data,keyField='id',empty='Sem dados.'}) => (
+      <div className="overflow-auto rounded-xl border">
+        <table className="min-w-full text-sm"><thead className="bg-gray-50"><tr>{columns.map((c,i)=>(<th key={i} className="sticky top-0 z-10 whitespace-nowrap border-b px-3 py-2 text-left font-semibold text-gray-700">{c.header}</th>))}</tr></thead>
+        <tbody className="divide-y">{data.length===0? (<tr><td colSpan={columns.length} className="px-3 py-6 text-center text-gray-500">{empty}</td></tr>): data.map(row=> (<tr key={row[keyField]} className="odd:bg-white even:bg-gray-50">{columns.map((c,i)=>(<td key={i} className="whitespace-nowrap px-3 py-2 align-top">{c.cell(row)}</td>))}</tr>))}</tbody></table>
+      </div>
+    );
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
